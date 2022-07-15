@@ -21,7 +21,7 @@ void wibo::debug_log(const char *fmt, ...) {
 	va_end(args);
 }
 
-#define FOR_256_3(a, b, c, d) FOR_ITER((a << 6 | b << 4 | c << 2 | d))
+#define FOR_256_3(a, b, c, d) FOR_ITER((a << 6 | b << 4 | c << 2 | d), a ## b ## c ## d)
 #define FOR_256_2(a, b) \
 	FOR_256_3(a, b, 0, 0) FOR_256_3(a, b, 0, 1) FOR_256_3(a, b, 0, 2) FOR_256_3(a, b, 0, 3) \
 	FOR_256_3(a, b, 1, 0) FOR_256_3(a, b, 1, 1) FOR_256_3(a, b, 1, 2) FOR_256_3(a, b, 1, 3) \
@@ -43,7 +43,48 @@ static void stubBase(int index) {
 }
 
 void (*stubFuncs[0x100])(void) = {
-#define FOR_ITER(i) []() { stubBase(i); },
+#define FOR_ITER(i, _) []() { stubBase(i); },
+FOR_256
+#undef FOR_ITER
+};
+
+static int wrapperIndex = 0;
+extern "C" void *wrappees[0x100];
+void *wrappees[0x100];
+extern "C" void *systemStackPtr;
+void *systemStackPtr;
+
+#define FOR_ITER(index, name) \
+	extern "C" void wrapper ## name(); \
+	asm( \
+		".text\n" \
+		".type wrapper" #name ", @function\n" \
+		"wrapper" #name ":\n\t" \
+		"push %edi\n\t" \
+		"push %esi\n\t" \
+		"leal 0xC(%esp), %esi\n\t" \
+		"movl (systemStackPtr), %edi\n\t" \
+		"movl $16, %ecx\n\t" \
+		"cld\n\t" \
+		"rep movsl\n\t" \
+		"leal 0x8(%esp), %esi\n\t" \
+		"sub $16*4, %edi\n\t" \
+		"movl %edi, %esp\n\t" \
+		"sub %esi, %edi\n\t" \
+		"movl (wrappees + 4 * " #index "), %ecx\n\t" \
+		"call *%ecx\n\t" \
+		"sub %edi, %esp\n\t" \
+		"movl (%esi), %edi\n\t" \
+		"movl %edi, (%esp)\n\t" \
+		"movl -4(%esi), %edi\n\t" \
+		"movl -8(%esi), %esi\n\t" \
+		"ret" \
+	);
+FOR_256
+#undef FOR_ITER
+
+void (*wrapperFuncs[0x100])(void) = {
+#define FOR_ITER(_, name) wrapper ## name,
 FOR_256
 #undef FOR_ITER
 };
@@ -62,6 +103,12 @@ static void *resolveMissingFunc(const char *dllName, const char *funcName) {
 	return (void *) stubFuncs[stubIndex++];
 }
 
+static void *wrapFunc(void *func) {
+	assert(wrapperIndex < 0x100);
+	wrappees[wrapperIndex] = func;
+	return (void *) wrapperFuncs[wrapperIndex++];
+}
+
 void *wibo::resolveFuncByName(const char *dllName, const char *funcName) {
 	void *func = nullptr;
 	if (strcasecmp(dllName, "KERNEL32.dll") == 0) {
@@ -77,7 +124,7 @@ void *wibo::resolveFuncByName(const char *dllName, const char *funcName) {
 	}
 
 	if (func)
-		return func;
+		return wrapFunc(func);
 	return resolveMissingFunc(dllName, funcName);
 }
 
@@ -90,7 +137,7 @@ void *wibo::resolveFuncByOrdinal(const char *dllName, uint16_t ordinal) {
 	}
 
 	if (func)
-		return func;
+		return wrapFunc(func);
 	char buf[16];
 	sprintf(buf, "%d", ordinal);
 	return resolveMissingFunc(dllName, buf);
@@ -116,6 +163,8 @@ int main(int argc, char **argv) {
 	if (getenv("WIBO_DEBUG")) {
 		wibo::debugEnabled = true;
 	}
+
+	systemStackPtr = (char*)malloc(1 << 20) + (1 << 20) - 0x10 * 4;
 
 	files::init();
 
